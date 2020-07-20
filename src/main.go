@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -18,10 +17,14 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/rs/cors"
 	"github.com/zairza-cetb/bench-routes/src/lib/api"
+	parser "github.com/zairza-cetb/bench-routes/src/lib/config"
 	"github.com/zairza-cetb/bench-routes/src/lib/filters"
 	"github.com/zairza-cetb/bench-routes/src/lib/logger"
-	"github.com/zairza-cetb/bench-routes/src/lib/parser"
+	"github.com/zairza-cetb/bench-routes/src/lib/modules/jitter"
+	"github.com/zairza-cetb/bench-routes/src/lib/modules/monitor"
+	"github.com/zairza-cetb/bench-routes/src/lib/modules/ping"
 	"github.com/zairza-cetb/bench-routes/src/lib/utils"
+	"github.com/zairza-cetb/bench-routes/src/metrics/journal"
 	"github.com/zairza-cetb/bench-routes/src/metrics/process"
 	sysMetrics "github.com/zairza-cetb/bench-routes/src/metrics/system"
 	"github.com/zairza-cetb/bench-routes/tsdb"
@@ -29,18 +32,27 @@ import (
 
 var (
 	port                        = ":9090" // default listen and serve at 9090
-	enableProcessCollection     = true    // default collection of process metrics in host of bench-routes
+	enableProcessCollection     = false   // default collection of process metrics in host of bench-routes
 	processCollectionScrapeTime = time.Second * 5
-	systemCollectionScrapeTime  = time.Second * 10
+	defaultScrapeTime           = time.Second * 3
+	systemMetricsPath           = "storage/system.json"
+	journalMetricsPath          = "storage/journal.json"
 	upgrader                    = websocket.Upgrader{
 		ReadBufferSize:  4096,
 		WriteBufferSize: 4096,
 	}
-	conf *parser.YAMLBenchRoutesType
+	initializedChains = make(map[string]bool)
+	conf              *parser.Config
+	// matrix is a collection (as map) of instances where each
+	// instance is composed of ping, jitter, floodping and monitor
+	// chain paths. matrix is used in the monitoring screen to
+	// reduce the http request by grouping them based on routes.
+	// Without matrix, the http traffic would increase 4 times
+	// the current count.
+	matrix = make(utils.BRmap)
 )
 
 func main() {
-
 	if len(os.Args) > 2 && os.Args[2] != "" {
 		enableProcessCollection, _ = strconv.ParseBool(os.Args[2])
 		port = ":" + os.Args[1]
@@ -48,71 +60,67 @@ func main() {
 		port = ":" + os.Args[1]
 	}
 
-	c := make(chan os.Signal)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-c
-		cleanup()
-		os.Exit(0)
-	}()
 	logger.Terminal("initializing...", "p")
 	conf = parser.New(utils.ConfigurationFilePath)
 	conf.Load().Validate()
-
-	var ConfigURLs []string
 	setDefaultServicesState(conf)
 
-	// Build TSDB chain
-	for _, r := range conf.Config.Routes {
-		found := false
-		for _, i := range ConfigURLs {
-			if i == r.URL {
-				found = true
-				break
+	var ConfigURLs []string
+	intervals := conf.Config.Interval
+	service := &struct {
+		Ping    *ping.Ping
+		Jitter  *jitter.Jitter
+		PingF   *ping.FloodPing
+		Monitor *monitor.Monitor
+	}{
+		Ping:    ping.New(conf, ping.TestInterval{OfType: intervals[0].Type, Duration: *intervals[0].Duration}, &utils.Pingc),
+		Jitter:  jitter.New(conf, jitter.TestInterval{OfType: intervals[0].Type, Duration: *intervals[1].Duration}, &utils.Jitterc),
+		PingF:   ping.Newf(conf, ping.TestInterval{OfType: intervals[0].Type, Duration: *intervals[0].Duration}, &utils.FPingc, conf.Config.Password),
+		Monitor: monitor.New(conf, monitor.TestInterval{OfType: intervals[2].Type, Duration: *intervals[2].Duration}, &utils.RespMonitoringc),
+	}
+
+	chainSet := tsdb.NewChainSet(tsdb.FlushAsTime, time.Second*30)
+
+	reload := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		for {
+			<-reload
+			fmt.Println("reloading...")
+			conf.Refresh()
+			for _, r := range conf.Config.Routes {
+				var found bool
+				for _, i := range ConfigURLs {
+					if i == r.URL {
+						found = true
+						break
+					}
+				}
+				if !found {
+					ConfigURLs = append(ConfigURLs, r.URL)
+					setMatrixKey(&matrix, r.URL)
+				}
 			}
+			var wg sync.WaitGroup
+			p := time.Now()
+			wg.Add(4)
+			go initialize(&wg, &matrix, chainSet, &utils.Pingc, ConfigURLs, utils.PathPing, "ping")
+			go initialize(&wg, &matrix, chainSet, &utils.FPingc, ConfigURLs, utils.PathFloodPing, "flood_ping")
+			go initialize(&wg, &matrix, chainSet, &utils.Jitterc, ConfigURLs, utils.PathJitter, "jitter")
+			go initialize(&wg, &matrix, chainSet, &utils.RespMonitoringc, conf.Config.Routes, utils.PathReqResDelayMonitoring, "req_res")
+			wg.Wait()
+			msg := "initialization time: " + time.Since(p).String()
+			logger.Terminal(msg, "p")
+			done <- struct{}{}
 		}
-		if !found {
-			filters.HTTPPingFilter(&r.URL)
-			ConfigURLs = append(ConfigURLs, r.URL)
-			utils.PingDBNames[r.URL] = utils.GetHash(r.URL)
-			utils.FloodPingDBNames[r.URL] = utils.GetHash(r.URL)
-		}
-	}
-	var wg sync.WaitGroup
-	p := time.Now()
-	wg.Add(4)
+	}()
+	reload <- struct{}{}
+	<-done
+	chainSet.Run()
 
-	go initialise(&wg, &utils.Pingc, ConfigURLs, utils.PathPing, "ping")
-	go initialise(&wg, &utils.FPingc, ConfigURLs, utils.PathFloodPing, "flood_ping")
-	go initialise(&wg, &utils.Jitterc, ConfigURLs, utils.PathJitter, "jitter")
-	go initialise(&wg, &utils.RespMonitoringc, conf.Config.Routes, utils.PathReqResDelayMonitoring, "req_res")
-
-	wg.Wait()
-	msg := "initial chain formation time: " + time.Since(p).String()
-	logger.Terminal(msg, "p")
-
-	// keep the below line to the end of file so that we ensure that we give a confirmation message only when all the
-	// required resources for the application is up and healthy.
-	logger.Terminal("Bench-routes is up and running", "p")
-
-	api := api.New()
+	api := api.New(&matrix, conf, service, &reload, &done)
 	router := mux.NewRouter()
-
-	const uiPathV1 = "ui-builds/v1.0/"
-	// API endpoints.
-	{
-		// static servings.
-		{
-			router.Handle("/", http.FileServer(http.Dir(uiPathV1)))
-			router.PathPrefix("/assets/").Handler(http.StripPrefix("/assets/", http.FileServer(http.Dir(uiPathV1+"assets/"))))
-			router.PathPrefix("/manifest.json").Handler(http.StripPrefix("/manifest.json", http.FileServer(http.Dir(uiPathV1+"/manifest.json"))))
-			router.PathPrefix("/static/").Handler(http.StripPrefix("/static/", http.FileServer(http.Dir(uiPathV1+"static/"))))
-		}
-		router.HandleFunc("/br-live-check", api.Home)
-		router.HandleFunc("/test", api.TestTemplate)
-		router.HandleFunc("/service-state", api.ServiceState)
-		router.HandleFunc("/routes-summary", api.RoutesSummary)
-	}
+	api.Register(router)
 
 	// Persistent connection for real-time updates between UI and the service.
 	router.HandleFunc("/websocket", func(w http.ResponseWriter, r *http.Request) {
@@ -122,6 +130,10 @@ func main() {
 			msg := "error using upgrader" + err.Error()
 			logger.Terminal(msg, "f")
 			os.Exit(1)
+		}
+
+		format := func(b bool) []byte {
+			return []byte(strconv.FormatBool(b))
 		}
 
 		// capture client request for enabling series of responses unless its killed
@@ -144,46 +156,46 @@ func main() {
 
 			sig := inStream[0] // Signal
 			msg := "type: " + strconv.Itoa(messageType) + " \n message: " + sig
-			logger.Terminal(msg, "p")
+			logger.File(msg, "p")
 			// generate appropriate signals from incoming messages
 			switch sig {
 			// ping
 			case "force-start-ping":
-				if e := ws.WriteMessage(1, []byte(strconv.FormatBool(HandlerPingGeneral("start")))); e != nil {
+				if e := ws.WriteMessage(1, format(service.Ping.Iterate("start", false))); e != nil {
 					panic(e)
 				}
 			case "force-stop-ping":
-				if e := ws.WriteMessage(1, []byte(strconv.FormatBool(HandlerPingGeneral("stop")))); e != nil {
+				if e := ws.WriteMessage(1, format(service.Ping.Iterate("stop", false))); e != nil {
 					panic(e)
 				}
 
 				// flood-ping
 			case "force-start-flood-ping":
-				if e := ws.WriteMessage(1, []byte(strconv.FormatBool(HandlerFloodPingGeneral("start")))); e != nil {
+				if e := ws.WriteMessage(1, format(service.PingF.Iteratef("start", false))); e != nil {
 					panic(e)
 				}
 			case "force-stop-flood-ping":
-				if e := ws.WriteMessage(1, []byte(strconv.FormatBool(HandlerFloodPingGeneral("stop")))); e != nil {
+				if e := ws.WriteMessage(1, format(service.PingF.Iteratef("stop", false))); e != nil {
 					panic(e)
 				}
 
 				// jitter
 			case "force-start-jitter":
-				if e := ws.WriteMessage(1, []byte(strconv.FormatBool(HandlerJitterGeneral("start")))); e != nil {
+				if e := ws.WriteMessage(1, format(service.Jitter.Iterate("start", false))); e != nil {
 					panic(e)
 				}
 			case "force-stop-jitter":
-				if e := ws.WriteMessage(1, []byte(strconv.FormatBool(HandlerJitterGeneral("stop")))); e != nil {
+				if e := ws.WriteMessage(1, format(service.Jitter.Iterate("start", false))); e != nil {
 					panic(e)
 				}
 
-				// request-response-monitoring
+				// request-monitor-monitoring
 			case "force-start-req-res-monitoring":
-				if e := ws.WriteMessage(1, []byte(strconv.FormatBool(HandleReqResGeneral("start")))); e != nil {
+				if e := ws.WriteMessage(1, format(service.Monitor.Iterate("start", false))); e != nil {
 					panic(e)
 				}
 			case "force-stop-req-res-monitoring":
-				if e := ws.WriteMessage(1, []byte(strconv.FormatBool(HandleReqResGeneral("stop")))); e != nil {
+				if e := ws.WriteMessage(1, format(service.Monitor.Iterate("stop", false))); e != nil {
 					panic(e)
 				}
 
@@ -193,75 +205,73 @@ func main() {
 				if e := ws.WriteMessage(1, filters.RouteYAMLtoJSONParser(m)); e != nil {
 					panic(e)
 				}
-
-				// Queries
-			case "Qping-route":
-				querier(ws, inStream, qPingRoute{})
-
-			case "Qjitter-route":
-				querier(ws, inStream, qJitterRoute{})
-
-			case "Qflood-ping-route":
-				querier(ws, inStream, qFloodPingRoute{})
-
-			// Querier signal for Request-response delay
-			case "Qrequest-response-delay-route":
-				querier(ws, inStream, qReqResDelayRoute{})
 			}
 		}
 	})
 
 	go func() {
-		var (
-			metrics = sysMetrics.New()
-		)
-
+		metrics := sysMetrics.New()
 		type metric struct {
-			cpu    string
-			memory sysMetrics.MemoryStats
-			disk   sysMetrics.DiskStats
+			cpu    *string
+			memory *sysMetrics.MemoryStats
+			disk   *sysMetrics.DiskStats
+			net    *sysMetrics.NetworkStats
 		}
 
-		combine := func(cpu, memory, disk string) string {
-			return cpu + "|" + memory + "|" + disk
-		}
-
-		chain := tsdb.NewChain("storage/system.json")
-		chain.Init().Commit()
+		chain := tsdb.NewChain(systemMetricsPath)
+		chain.Init()
+		chainSet.Register(chain.Name, chain)
 
 		for {
 			// collections for cpu, memory and disk run independently and are
-			// time dependent. Hence, running these serailly will take more
-			// time than the actual `systemCollectionScrapeTime`. Hence, the
-			// best way is to run them parallely and get datas via channels,
-			// such that systemCollectionScrapeTime >= duration(cpu|memory|disk)
-			// will meet excepted systemCollectionScrapeTime. Anything other
+			// time dependent. Hence, running these serially will take more
+			// time than the actual `defaultScrapeTime`. Hence, the
+			// best way is to run them in parallel and get data via channels,
+			// such that defaultScrapeTime >= duration(cpu|memory|disk)
+			// will meet excepted defaultScrapeTime. Anything other
 			// than this will be inaccurate.
-			cpu := make(chan string)
-			memory := make(chan sysMetrics.MemoryStats)
-			disk := make(chan sysMetrics.DiskStats)
+			cpu := make(chan *string)
+			memory := make(chan *sysMetrics.MemoryStats)
+			disk := make(chan *sysMetrics.DiskStats)
+			net := make(chan *sysMetrics.NetworkStats)
 
 			go metrics.GetTotalCPUUsage(cpu)
 			go metrics.GetVirtualMemoryStats(memory)
 			go metrics.GetDiskIOStats(disk)
+			go metrics.GetNetworkStats(net)
 
 			data := &metric{
 				cpu:    <-cpu,
 				memory: <-memory,
 				disk:   <-disk,
+				net:    <-net,
 			}
-
-			encoded := combine(
-				metrics.Encode(data.cpu), metrics.Encode(data.memory), metrics.Encode(data.disk),
+			encoded := metrics.Combine(
+				metrics.Encode(*data.cpu), metrics.Encode(*data.memory), metrics.Encode(*data.disk), metrics.Encode(*data.net),
 			)
 
 			block := tsdb.GetNewBlock("sys", encoded)
-
-			chain.Append(*block).Commit()
-
-			time.Sleep(systemCollectionScrapeTime)
+			chain.Append(*block)
+			time.Sleep(defaultScrapeTime)
 		}
 	}()
+
+	if !(runtime.GOOS == "windows" || runtime.GOOS == "darwin") {
+		go func() {
+			metrics := journal.New()
+			chain := tsdb.NewChain(journalMetricsPath)
+			chain.Init()
+			chainSet.Register(chain.Name, chain)
+
+			for {
+				data := metrics.Run().Get()
+				datapoint := data.Encode()
+				block := tsdb.GetNewBlock("journal", *datapoint)
+				chain.Append(*block)
+				time.Sleep(defaultScrapeTime)
+			}
+		}()
+	}
 
 	if enableProcessCollection {
 		go func() {
@@ -276,7 +286,8 @@ func main() {
 			)
 			assignChaintoMap := func(c *map[string]*tsdb.Chain, n, path string) {
 				(*c)[n] = tsdb.NewChain(path)
-				(*c)[n].Init().Commit()
+				(*c)[n].Init()
+				chainSet.Register((*c)[n].Name, (*c)[n])
 			}
 			processChains := make(map[string]*tsdb.Chain)
 			for {
@@ -298,7 +309,7 @@ func main() {
 						assignChaintoMap(&processChains, ps.FilteredCommand, p)
 					}
 					b := tsdb.GetNewBlock("ps", ps.Encode())
-					processChains[ps.FilteredCommand].Append(*b).Commit()
+					processChains[ps.FilteredCommand].Append(*b)
 					wg.Done()
 				}
 				wg.Wait()
@@ -313,197 +324,130 @@ func main() {
 		time.Sleep(time.Duration(time.Minute * 3))
 	}()
 
-	logger.Terminal(http.ListenAndServe(port, cors.Default().Handler(router)).Error(), "f")
-}
+	// Reset Services.
+	c := make(chan os.Signal)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-c
+		logger.Terminal(fmt.Sprintf("Alive %d goroutines", runtime.NumGoroutine()), "p")
+		conf.Refresh()
+		values := reflect.ValueOf(conf.Config.UtilsConf.ServicesSignal)
+		typeOfServiceState := values.Type()
 
-func cleanup() {
-	logger.Terminal(fmt.Sprintf("Alive %d goroutines", runtime.NumGoroutine()), "p")
-	conf.Refresh()
-	values := reflect.ValueOf(conf.Config.UtilsConf.ServicesSignal)
-	typeOfServiceState := values.Type()
+		type serviceState struct {
+			service string
+			state   string
+		}
 
-	type serviceState struct {
-		service string
-		state   string
-	}
-
-	var serviceStateValues []serviceState
-	for i := 0; i < values.NumField(); i++ {
-		n := serviceState{service: typeOfServiceState.Field(i).Name, state: values.Field(i).Interface().(string)}
-		serviceStateValues = append(serviceStateValues, n)
-	}
-	for _, node := range serviceStateValues {
-		if node.state == "active" {
-			switch node.service {
-			case "Ping":
-				HandlerPingGeneral("stop")
-			case "FloodPing":
-				HandlerFloodPingGeneral("stop")
-			case "Jitter":
-				HandlerJitterGeneral("stop")
-			case "ReqResDelayMonitoring":
-				HandleReqResGeneral("stop")
+		var serviceStateValues []serviceState
+		for i := 0; i < values.NumField(); i++ {
+			n := serviceState{service: typeOfServiceState.Field(i).Name, state: values.Field(i).Interface().(string)}
+			serviceStateValues = append(serviceStateValues, n)
+		}
+		for _, node := range serviceStateValues {
+			if node.state == "active" {
+				switch node.service {
+				case "Ping":
+					service.Ping.Iterate("stop", false)
+				case "FloodPing":
+					service.PingF.Iteratef("stop", false)
+				case "Jitter":
+					service.Jitter.Iterate("stop", false)
+				case "ReqResDelayMonitoring":
+					service.Monitor.Iterate("stop", false)
+				}
 			}
 		}
-	}
-	logger.Terminal(fmt.Sprintf("Alive %d goroutines after cleaning up.", runtime.NumGoroutine()), "p")
+		logger.Terminal(fmt.Sprintf("Alive %d goroutines after cleaning up.", runtime.NumGoroutine()), "p")
+		os.Exit(0)
+	}()
+	logger.Terminal(http.ListenAndServe(port, cors.Default().Handler(router)).Error(), "f")
+	// keep the below line to the end of file so that we ensure that we give a confirmation message only when all the
+	// required resources for the application is up and healthy.
+	logger.Terminal("Bench-routes is up and running", "p")
 }
 
-func initialise(wg *sync.WaitGroup, chain *[]*tsdb.Chain, conf interface{}, basePath, Type string) {
-	msg := "forming " + Type + " chain ... "
-	logger.Terminal(msg, "p")
+func setMatrixKey(matrix *utils.BRmap, url string) {
+	var urlExists bool
+	for instance := range *matrix {
+		if (*matrix)[instance].FullURL == url {
+			urlExists = true
+			break
+		}
+	}
+	if !urlExists {
+		(*matrix)[len(*matrix)] = &utils.BRMatrix{
+			FullURL: url,
+		}
+	}
+}
+
+func initialize(wg *sync.WaitGroup, matrix *utils.BRmap, chainSet *tsdb.ChainSet, chain *[]*tsdb.Chain, conf interface{}, basePath, Type string) {
+	var (
+		msg = "forming " + Type + " chain ... "
+		mux sync.RWMutex
+	)
+	logger.File(msg, "p")
 	config, ok := conf.([]string)
+	mux.Lock()
+	defer mux.Unlock()
 	if ok {
 		for _, v := range config {
+			v = filters.HTTPPingFilterValue(v)
 			path := basePath + "/chunk_" + Type + "_" + v + ".json"
-
-			resp := &tsdb.Chain{
-				Path:           path,
-				Chain:          []tsdb.Block{},
-				LengthElements: 0,
-				Size:           0,
-			}
-			resp.Init().Commit()
+			resp := tsdb.NewChain(path)
+			resp.Init()
 			*chain = append(*chain, resp)
+			for k := range *matrix {
+				index := k
+				if filters.HTTPPingFilterValue((*matrix)[k].FullURL) == v {
+					switch Type {
+					case "ping":
+						(*matrix)[index].PingChain = resp
+					case "jitter":
+						(*matrix)[index].JitterChain = resp
+					case "flood_ping":
+						(*matrix)[index].FPingChain = resp
+					}
+				}
+			}
 		}
 	}
-	if configRes, ok := conf.([]parser.Routes); ok {
+	if configRes, ok := conf.([]parser.Route); ok {
 		for _, v := range configRes {
-			fmt.Println(v.URL + v.Route)
-			path := basePath + "/chunk_" + Type + "_" + filters.RouteDestroyer(v.URL+"_"+v.Route) + ".json"
-			resp := &tsdb.Chain{
-				Path:           path,
-				Chain:          []tsdb.Block{},
-				LengthElements: 0,
-				Size:           0,
+			path := basePath + "/chunk_" + Type + "_" + filters.RouteDestroyer(v.URL) + ".json"
+			if _, ok := initializedChains[path]; ok {
+				continue
 			}
-			resp.Init().Commit()
+			initializedChains[path] = true
+			resp := tsdb.NewChain(path)
+			resp.Init()
 			*chain = append(*chain, resp)
+			for k := range *matrix {
+				if (*matrix)[k].FullURL == v.URL {
+					(*matrix)[k] = &utils.BRMatrix{
+						FullURL:      v.URL,
+						MonitorChain: resp,
+						Domain:       fmt.Sprintf("%s: %s", v.Method, v.URL),
+						PingChain:    (*matrix)[k].PingChain,
+						JitterChain:  (*matrix)[k].JitterChain,
+						FPingChain:   (*matrix)[k].FPingChain,
+					}
+					break
+				}
+			}
 		}
+	}
+	for _, chain := range *chain {
+		chainSet.Register(chain.Name, chain)
 	}
 
 	logger.Terminal("finished "+Type+" chain", "p")
 	wg.Done()
 }
 
-func querier(ws *websocket.Conn, inComingStream []string, route interface{}) {
-	message := getMessageFromCompoundSignal(inComingStream[1:])
-	var response []interface{}
-	switch route.(type) {
-	case qPingRoute:
-		inst := qPingRoute{}
-		if e := json.Unmarshal(message, &inst); e != nil {
-			panic(e)
-		}
-
-		raw := getInBlocks(ws, "ping", inst.URL)
-		for i, b := range raw {
-			decRaw := utils.Decode(b)
-			dec, ok := decRaw.(utils.Ping)
-			if !ok {
-				panic("invalid interface type")
-			}
-			response = append(response, utils.PingResp{
-				Min:            dec.Min,
-				Mean:           dec.Mean,
-				Max:            dec.Max,
-				MDev:           dec.MDev,
-				NormalizedTime: b.GetNormalizedTime(),
-				Timestamp:      b.GetTimeStamp(),
-				Relative:       i,
-			})
-		}
-
-	case qJitterRoute:
-		inst := qJitterRoute{}
-		if e := json.Unmarshal(message, &inst); e != nil {
-			panic(e)
-		}
-
-		raw := getInBlocks(ws, "jitter", inst.URL)
-		for i, b := range raw {
-			decRaw, ok := utils.Decode(b).(float64)
-			if !ok {
-				panic("invalid interface type")
-			}
-			response = append(response, utils.JitterResp{
-				Datapoint:      decRaw,
-				NormalizedTime: b.GetNormalizedTime(),
-				Timestamp:      b.GetTimeStamp(),
-				Relative:       i,
-			})
-		}
-
-	case qFloodPingRoute:
-		inst := qFloodPingRoute{}
-		if e := json.Unmarshal(message, &inst); e != nil {
-			panic(e)
-		}
-
-		raw := getInBlocks(ws, "flood-ping", inst.URL)
-		for i, b := range raw {
-			dec, ok := utils.Decode(b).(utils.FloodPing)
-			if !ok {
-				panic("invalid interface type")
-			}
-			response = append(response, utils.FloodPingResp{
-				Min:            dec.Min,
-				Mean:           dec.Mean,
-				Max:            dec.Max,
-				MDev:           dec.MDev,
-				PacketLoss:     dec.PacketLoss,
-				NormalizedTime: b.GetNormalizedTime(),
-				Timestamp:      b.GetTimeStamp(),
-				Relative:       i,
-			})
-		}
-
-	case qReqResDelayRoute:
-		inst := qReqResDelayRoute{}
-		if e := json.Unmarshal(message, &inst); e != nil {
-			panic(e)
-		}
-
-		raw := getInBlocks(ws, "req-res-delay", inst.URL)
-		for i, b := range raw {
-			dec, ok := utils.Decode(b).(utils.Response)
-			if !ok {
-				panic("invalid interface type")
-			}
-			response = append(response, utils.ResponseResp{
-				ResLength:      dec.ResLength,
-				ResStatusCode:  dec.ResStatusCode,
-				Delay:          dec.Delay,
-				NormalizedTime: b.GetNormalizedTime(),
-				Timestamp:      b.GetTimeStamp(),
-				Relative:       i,
-			})
-		}
-	}
-	respond(ws, response)
-}
-
-func getInBlocks(ws *websocket.Conn, Type, URL string) []tsdb.Block {
-	ql := getQuerier(ws, Type, URL, "", "")
-	return inBlocks(ql.FetchAllSeriesStringified())
-}
-
-func getQuerier(conn *websocket.Conn, serviceName, d, method, suff string) (inst tsdb.BRQuerier) {
-	inst = tsdb.BRQuerier{
-		ServiceName: serviceName,
-		Route:       tsdb.BQRoute{DomainIP: d, Method: method},
-		Suffix:      suff,
-		Connection:  conn,
-	}
-	return
-}
-
-func getMessageFromCompoundSignal(arg []string) []byte {
-	return []byte(strings.Join(arg, " "))
-}
-
 // setDefaultServicesState initializes all state values to passive.
-func setDefaultServicesState(configuration *parser.YAMLBenchRoutesType) {
+func setDefaultServicesState(configuration *parser.Config) {
 	configuration.Config.UtilsConf.ServicesSignal = parser.ServiceSignals{
 		Ping:                  "passive",
 		Jitter:                "passive",
@@ -511,23 +455,6 @@ func setDefaultServicesState(configuration *parser.YAMLBenchRoutesType) {
 		ReqResDelayMonitoring: "passive",
 	}
 	if _, e := configuration.Write(); e != nil {
-		panic(e)
-	}
-}
-
-func inBlocks(s string) (tmp []tsdb.Block) {
-	if err := json.Unmarshal([]byte(s), &tmp); err != nil {
-		panic(err)
-	}
-	return
-}
-
-func respond(ws *websocket.Conn, inf interface{}) {
-	js, err := json.Marshal(inf)
-	if err != nil {
-		panic(err)
-	}
-	if e := ws.WriteMessage(1, js); e != nil {
 		panic(e)
 	}
 }

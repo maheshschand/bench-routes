@@ -3,6 +3,11 @@
 
 package utils
 
+import (
+	// parser "github.com/zairza-cetb/bench-routes/src/lib/config"
+	"github.com/zairza-cetb/bench-routes/tsdb"
+)
+
 // Ping type for storing Ping values in TSDB
 type Ping struct {
 	Min  float64
@@ -53,11 +58,11 @@ type FloodPingResp struct {
 
 // Response struct
 // This is the object that we return from resp_delay module
-// Contains delay in response and the response length
+// Contains delay in monitor and the monitor length
 type Response struct {
-	Delay         int
-	ResLength     int
-	ResStatusCode int
+	Delay         float64 `json:"delay"`
+	ResLength     int     `json:"resLength"`
+	ResStatusCode int     `json:"resStatusCode"`
 }
 
 // ResponseResp for responding the querier.
@@ -69,3 +74,35 @@ type ResponseResp struct {
 	Timestamp      string `json:"Timestamp"`
 	Relative       int    `json:"relative"`
 }
+
+// ResponseTSDBChains as response type for information on the tsdb chains.
+type ResponseTSDBChains struct {
+	Name string    `json:"name"`
+	Path ChainPath `json:"path"`
+}
+
+// ChainPath keeps the path of all chains corresponding to a matrix value.
+type ChainPath struct {
+	InstanceKey int    `json:"matrixName"`
+	Ping        string `json:"ping"`
+	Jitter      string `json:"jitter"`
+	Fping       string `json:"fping"`
+	Monitor     string `json:"monitor"`
+}
+
+// MatrixResponse wraps the block stream of the chains.
+type MatrixResponse struct {
+	PingBlocks    []byte `json:"ping"`
+	JitterBlocks  []byte `json:"jitter"`
+	FpingBlocks   []byte `json:"fping"`
+	MonitorBlocks []byte `json:"monitor"`
+}
+
+// BRMatrix type for storing multi-dimensional information related to a route.
+type BRMatrix struct {
+	FullURL, Domain                                  string
+	PingChain, JitterChain, FPingChain, MonitorChain *tsdb.Chain
+}
+
+// BRmap forms a map of matrix that can be accessed with least possible time.
+type BRmap map[int]*BRMatrix

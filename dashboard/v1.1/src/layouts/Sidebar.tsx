@@ -16,10 +16,11 @@ import {
   ExpandLess as ExpandLessIcon,
   ExpandMore as ExpandMoreIcon,
   NetworkCheck as NetworkCheckIcon,
+  PostAdd as PostAddIcon,
   Settings as SettingsIcon
 } from '@material-ui/icons';
 import clsx from 'clsx';
-import React, { useState } from 'react';
+import React, { FC, useState } from 'react';
 import { HashRouter as Router, Link } from 'react-router-dom';
 
 const drawerWidth = 240;
@@ -70,7 +71,12 @@ const useStyles = makeStyles(theme => ({
   }
 }));
 
-export default function Sidebar(props) {
+interface SidebarProps {
+  open: boolean;
+  handleDrawerClose(): void;
+}
+
+const Sidebar: FC<SidebarProps> = ({ handleDrawerClose, open }) => {
   const classes = useStyles();
 
   // Sidebar element
@@ -92,12 +98,18 @@ export default function Sidebar(props) {
         </ListItemIcon>
         <ListItemText primary="Monitoring" />
       </ListItem>
+      <ListItem button={true} component={Link} to="/quick-input">
+        <ListItemIcon>
+          <PostAddIcon />
+        </ListItemIcon>
+        <ListItemText primary="Quick Input" />
+      </ListItem>
       <ListItem button={true}>
         <ListItemIcon>
           <NetworkCheckIcon />
         </ListItemIcon>
         <ListItemText primary="Tests" onClick={showTestList} />
-        {props.open ? (
+        {open ? (
           <ExpandLessIcon onClick={showTestList} />
         ) : (
           <ExpandMoreIcon onClick={showTestList} />
@@ -141,6 +153,12 @@ export default function Sidebar(props) {
           </ListItem>
         </List>
       </Collapse>
+      <ListItem button={true} component={Link} to="/configurations">
+        <ListItemIcon>
+          <SettingsIcon />
+        </ListItemIcon>
+        <ListItemText primary="Config" />
+      </ListItem>
     </div>
   );
 
@@ -150,33 +168,21 @@ export default function Sidebar(props) {
         <Drawer
           variant="permanent"
           classes={{
-            paper: clsx(
-              classes.drawerPaper,
-              !props.open && classes.drawerPaperClose
-            )
+            paper: clsx(classes.drawerPaper, !open && classes.drawerPaperClose)
           }}
-          open={props.open}
+          open={open}
         >
           <div className={classes.toolbarIcon}>
-            <IconButton onClick={props.handleDrawerClose}>
+            <IconButton onClick={handleDrawerClose}>
               <ChevronLeftIcon />
             </IconButton>
           </div>
           <Divider />
           <List>{menuItems}</List>
-          <ListItem
-            button={true}
-            component={Link}
-            to="/settings"
-            className={classes.settings}
-          >
-            <ListItemIcon>
-              <SettingsIcon />
-            </ListItemIcon>
-            <ListItemText primary="Settings" />
-          </ListItem>
         </Drawer>
       </Router>
     </div>
   );
-}
+};
+
+export default Sidebar;

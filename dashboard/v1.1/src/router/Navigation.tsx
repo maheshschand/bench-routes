@@ -1,23 +1,39 @@
-import React from 'react';
+import React, { FC } from 'react';
 import { HashRouter as Router, Route, Switch } from 'react-router-dom';
-import Dashboard from '../pages/Dashboard';
+import Config from '../pages/Config/Config';
+import Dashboard from '../pages/Dashboard/Dashboard';
 import FloodPing from '../pages/FloodPing';
-import Jitter from '../pages/Jitter';
-import Monitoring from '../pages/Monitoring';
-import Ping from '../pages/Ping';
-import Settings from '../pages/Settings';
+import Input from '../pages/Input/Input';
+import JitterModule from '../pages/Jitter/JitterModule';
+import Monitoring from '../pages/Monitoring/Monitoring';
+import PingModule from '../pages/Ping/PingModule';
 
-const Navigator = () => (
-  <Router>
-    <Switch>
-      <Route exact={true} path="/" component={Dashboard} />
-      <Route path="/monitoring" component={Monitoring} />
-      <Route path="/ping" component={Ping} />
-      <Route path="/floodping" component={FloodPing} />
-      <Route path="/jitter" component={Jitter} />
-      <Route path="/settings" component={Settings} />
-    </Switch>
-  </Router>
-);
+interface NavigatorProps {
+  updateLoader(status: boolean): void;
+}
+
+const Navigator: FC<NavigatorProps> = ({ updateLoader }) => {
+  return (
+    <Router>
+      <Switch>
+        <Route
+          exact={true}
+          path="/"
+          render={props => <Dashboard updateLoader={updateLoader} />}
+        />
+        <Route
+          exact={true}
+          path="/monitoring"
+          render={props => <Monitoring updateLoader={updateLoader} />}
+        />
+        <Route path="/ping" component={PingModule} />
+        <Route path="/floodping" component={FloodPing} />
+        <Route path="/jitter" component={JitterModule} />
+        <Route path="/quick-input" component={Input} />
+        <Route path="/configurations" component={Config} />
+      </Switch>
+    </Router>
+  );
+};
 
 export default Navigator;

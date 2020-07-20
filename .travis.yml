@@ -1,6 +1,5 @@
 os:
   - linux
-  # - mac
 
 addons:
   chrome: stable
@@ -9,11 +8,12 @@ sudo: required
 
 matrix:
   include:
-    - language: go
-
+    - language: 
+      - go
+      
       go:
         1.13.x
-
+      
       notifications:
         gitter:
           on_success: always
@@ -22,6 +22,14 @@ matrix:
 
       before_script:
         - go get -u ./...
+        # Installing nvm and nodejs
+        - curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.35.3/install.sh | bash
+        - source ~/.bashrc
+        - nvm install 12
+        - npm install --dev
+        - npm install
+        - npm install -g eslint electron electron-packager tslint prettier
+        - cd tests/ && npm install chromedriver@latest && cd ..
         - curl -sfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh| sh -s -- -b $(go env GOPATH)/bin v1.18.0
         - echo "checking linting in golang ..."
         - golangci-lint run
@@ -31,9 +39,9 @@ matrix:
         - echo "perfect go format. moving ahead ..."
 
       script:
+        - make build-frontend
         - make build
-        - make test
-        - xvfb-run -s "-screen 0 1920x1080x16" -a make test-services
+        - make test-non-verbose
         - make test_complete
         # test release-bot by creating a valid release
         - echo "testing release-bot by creating a valid release"
@@ -42,7 +50,7 @@ matrix:
     - language: node_js
 
       node_js:
-        - '10'
+        - "12"
 
       cache:
         directories:
@@ -61,5 +69,4 @@ matrix:
         - cd tests/ && npm install chromedriver && cd ..
 
       script:
-        - make test-views-v1.0
         - make test-views-v1.1
